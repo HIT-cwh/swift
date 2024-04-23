@@ -28,6 +28,11 @@ try:
 except ImportError:
     from transformers.deepspeed import is_deepspeed_zero3_enabled
 
+from xtuner.parallel.sequence import (
+    init_sequence_parallel, SequenceParallelSampler, reduce_sequence_parallel_loss,
+    get_sequence_parallel_world_size)
+from transformers.trainer_utils import seed_worker
+import torch.distributed as dist
 
 class Trainer(PushToMsHubMixin, SwiftMixin, HfTrainer):
     pass
@@ -35,7 +40,7 @@ class Trainer(PushToMsHubMixin, SwiftMixin, HfTrainer):
 
 class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, sequence_parallel_size=1, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # performance
         self.perf: Dict[str, Any] = {
@@ -49,6 +54,9 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
                 self.model, 'get_trainable_parameters') else None,
         }
         self._acc = torch.tensor(0.).to(self.args.device)
+
+        self.sequence_parallel_size = sequence_parallel_size
+        init_sequence_parallel(sequence_parallel_size)
 
     def train(self, *args, **kwargs) -> torch.Tensor:
         res = super().train(*args, **kwargs)
@@ -216,8 +224,24 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
 
         if self.label_smoother is not None and 'labels' in inputs:
             labels = inputs.pop('labels')
+        
+        # breakpoint()
 
         outputs = model(**inputs)
+
+        labels = inputs['labels']
+        num_tokens = (labels != -100).sum()
+        loss = reduce_sequence_parallel_loss(outputs.loss, num_tokens)
+        outputs.loss = loss
+
+        if dist.get_rank() == 0:
+            if not hasattr(self, 'cnt'):
+                self.cnt = 1
+            else:
+                self.cnt += 1
+            with open(f'logs/log_sp{get_sequence_parallel_world_size()}.txt', 'a+') as f:
+                f.write(f'step {self.cnt} tr_loss_step = {loss} \n')
+
         if loss_scale is not None:
             outputs['loss'] = self.compute_scaled_loss(labels, outputs.logits,
                                                        loss_scale)
@@ -295,7 +319,33 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
 
     def get_eval_dataloader(self, eval_dataset):
         if not use_torchacc():
-            return super().get_eval_dataloader(eval_dataset)
+            import datasets
+
+            if self.train_dataset is None:
+                raise ValueError("Trainer: training requires a train_dataset.")
+
+            train_dataset = self.train_dataset
+            data_collator = self.data_collator
+            if isinstance(train_dataset, datasets.Dataset):
+                train_dataset = self._remove_unused_columns(train_dataset, description="training")
+            else:
+                data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
+
+            dataloader_params = {
+                "batch_size": self._train_batch_size,
+                "collate_fn": data_collator,
+                "num_workers": self.args.dataloader_num_workers,
+                "pin_memory": self.args.dataloader_pin_memory,
+                "persistent_workers": self.args.dataloader_persistent_workers,
+            }
+
+            if not isinstance(train_dataset, torch.utils.data.IterableDataset):
+                dataloader_params["sampler"] = SequenceParallelSampler(train_dataset, seed=1024)
+                dataloader_params["drop_last"] = self.args.dataloader_drop_last
+                dataloader_params["worker_init_fn"] = seed_worker
+            
+            return DataLoader(train_dataset, **dataloader_params)
+            # return super().get_eval_dataloader(eval_dataset)
         else:
             import torchacc as ta
             if trainer.is_datasets_available():

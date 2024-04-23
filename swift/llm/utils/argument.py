@@ -487,6 +487,10 @@ class SftArguments(ArgumentsBase):
     # fsdp config file
     fsdp_config: Optional[str] = None
 
+    train_ds_cache: Optional[str] = None
+    val_ds_cache: Optional[str] = None
+    sequence_parallel_size: int = 1
+
     def handle_dataset_mixture(self, train_dataset: HfDataset) -> None:
         if train_dataset is None:
             return train_dataset

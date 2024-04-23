@@ -17,6 +17,7 @@ from swift.utils import (activate_model_parameters, freeze_model_parameters,
                          get_logger, use_torchacc)
 from .utils import (SftArguments, find_all_linears, find_embedding, find_ln,
                     is_adapter)
+from xtuner.model.modules.dispatch import dispatch_modules
 
 logger = get_logger()
 
@@ -185,6 +186,7 @@ def prepare_model(model, args: SftArguments):
             model.load_state_dict(state_dict, False)
             # release memory
             del state_dict
+        dispatch_modules(model)
     else:
         raise ValueError(f'args.sft_type: {args.sft_type}')
 

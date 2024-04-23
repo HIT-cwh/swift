@@ -15,6 +15,7 @@ from transformers import PreTrainedTokenizerBase, StoppingCriteria
 from swift.llm.agent.utils import calculate_loss_scale
 from swift.torchacc_utils import pad_and_split_batch
 from swift.utils import get_dist_setting, use_torchacc
+from xtuner.parallel.sequence import pad_for_sequence_parallel, split_for_sequence_parallel, get_sequence_parallel_group
 
 DEFAULT_SYSTEM = 'You are a helpful assistant.'
 History = List[Union[Tuple[str, str], List[str]]]
@@ -448,10 +449,21 @@ class Template:
                 padding_to, input_ids, attention_mask, labels, loss_scale,
                 self.max_length, self.tokenizer, rank, world_size)
 
+        bs, seq_len = input_ids.shape
+        position_ids = torch.arange(seq_len).unsqueeze(0).long().repeat(bs, 1)
+
+        input_ids, labels, position_ids, attention_mask = \
+            pad_for_sequence_parallel(input_ids, labels, position_ids, attention_mask)
+        sp_group = get_sequence_parallel_group()
+        input_ids = split_for_sequence_parallel(input_ids, dim=1, sp_group=sp_group)
+        labels = split_for_sequence_parallel(labels, dim=1, sp_group=sp_group)
+        position_ids = split_for_sequence_parallel(position_ids, dim=1, sp_group=sp_group)
+        
         res = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'labels': labels,
+            'position_ids': position_ids
         }
         if loss_scale is not None:
             res['loss_scale'] = loss_scale

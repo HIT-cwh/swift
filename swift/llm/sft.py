@@ -25,11 +25,13 @@ from .utils import (TEMPLATE_MAPPING, LazyLLMDataset, SftArguments, Template,
                     get_model_tokenizer, get_template, get_time_info,
                     print_example, set_generation_config, sort_by_max_length,
                     stat_dataset)
+from xtuner.parallel.sequence import init_dist
 
 logger = get_logger()
 
 
 def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
+    init_dist('slurm', 'nccl', init_backend='deepspeed', port=29000)
     logger.info(f'args: {args}')
     seed_everything(args.seed)
     training_args = args.training_args
@@ -130,39 +132,41 @@ def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
             fsdp_flatten_parameters=False)
 
     # Loading Dataset
-    random_state = np.random.RandomState(args.dataset_seed)
-    train_dataset, val_dataset = get_dataset(
-        args.dataset,
-        args.dataset_test_ratio,
-        random_state,
-        check_dataset_strategy=args.check_dataset_strategy)
-    val_dataset_sample = args.val_dataset_sample
-    if train_dataset is not None and args.train_dataset_sample >= 0:
-        train_dataset_sample = min(args.train_dataset_sample,
-                                   train_dataset.shape[0])
-        if train_dataset.shape[0] > train_dataset_sample:
-            logger.info(f'train_dataset_sample: {train_dataset_sample}')
-            train_idxs = random_state.permutation(train_dataset_sample)
-            train_dataset = train_dataset.select(train_idxs)
-        if val_dataset_sample is None:
-            val_dataset_sample = max(
-                int(train_dataset_sample * args.dataset_test_ratio), 1)
-    if val_dataset is not None and val_dataset_sample is not None and val_dataset_sample >= 0:
-        if val_dataset.shape[0] > val_dataset_sample:
-            logger.info(f'val_dataset_sample: {val_dataset_sample}')
-            val_idxs = random_state.permutation(val_dataset_sample)
-            val_dataset = val_dataset.select(val_idxs)
+    if args.train_ds_cache is None:
+        random_state = np.random.RandomState(args.dataset_seed)
+        train_dataset, val_dataset = get_dataset(
+            args.dataset,
+            args.dataset_test_ratio,
+            random_state,
+            check_dataset_strategy=args.check_dataset_strategy)
+        val_dataset_sample = args.val_dataset_sample
+        if train_dataset is not None and args.train_dataset_sample >= 0:
+            train_dataset_sample = min(args.train_dataset_sample,
+                                    train_dataset.shape[0])
+            if train_dataset.shape[0] > train_dataset_sample:
+                logger.info(f'train_dataset_sample: {train_dataset_sample}')
+                train_idxs = random_state.permutation(train_dataset_sample)
+                train_dataset = train_dataset.select(train_idxs)
+            if val_dataset_sample is None:
+                val_dataset_sample = max(
+                    int(train_dataset_sample * args.dataset_test_ratio), 1)
+        if val_dataset is not None and val_dataset_sample is not None and val_dataset_sample >= 0:
+            if val_dataset.shape[0] > val_dataset_sample:
+                logger.info(f'val_dataset_sample: {val_dataset_sample}')
+                val_idxs = random_state.permutation(val_dataset_sample)
+                val_dataset = val_dataset.select(val_idxs)
 
-    train_dataset = args.handle_dataset_mixture(train_dataset)
+        train_dataset = args.handle_dataset_mixture(train_dataset)
 
-    # add self-cognition dataset
-    if args.self_cognition_sample > 0:
-        train_dataset = add_self_cognition_dataset(train_dataset,
-                                                   args.self_cognition_sample,
-                                                   args.model_name,
-                                                   args.model_author)
-    logger.info(f'train_dataset: {train_dataset}')
-    logger.info(f'val_dataset: {val_dataset}')
+        # add self-cognition dataset
+        if args.self_cognition_sample > 0:
+            train_dataset = add_self_cognition_dataset(train_dataset,
+                                                    args.self_cognition_sample,
+                                                    args.model_name,
+                                                    args.model_author)
+        logger.info(f'train_dataset: {train_dataset}')
+        logger.info(f'val_dataset: {val_dataset}')
+
     template_kwargs = {}
     template_info = TEMPLATE_MAPPING[args.template_type]
     use_model = template_info.get('use_model', False)
@@ -176,29 +180,43 @@ def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
     args.system = template.default_system
     logger.info(f'system: {args.system}')
     logger.info(f'args.lazy_tokenize: {args.lazy_tokenize}')
-    if not args.lazy_tokenize:
-        dataset_info = {}
-        logger.info(f'Using num_proc: {args.preprocess_num_proc}')
-        train_dataset = dataset_map(train_dataset, template.encode,
-                                    args.preprocess_num_proc)
-        if val_dataset is not None:
-            val_dataset = dataset_map(val_dataset, template.encode,
-                                      args.preprocess_num_proc)
-        if args.test_oom_error:
-            train_dataset = sort_by_max_length(train_dataset, 20000)
-        # Data analysis
-        td0, tkwargs0 = train_dataset.data[0]
-        print_example(td0, tokenizer, tkwargs0)
-        dataset_info['train_dataset'] = stat_dataset(train_dataset)
-        if val_dataset is not None:
-            dataset_info['val_dataset'] = stat_dataset(val_dataset)
+
+    if args.train_ds_cache is None:
+
+        if not args.lazy_tokenize:
+            dataset_info = {}
+            logger.info(f'Using num_proc: {args.preprocess_num_proc}')
+            train_dataset = dataset_map(train_dataset, template.encode,
+                                        args.preprocess_num_proc)
+            if val_dataset is not None:
+                val_dataset = dataset_map(val_dataset, template.encode,
+                                        args.preprocess_num_proc)
+            if args.test_oom_error:
+                train_dataset = sort_by_max_length(train_dataset, 20000)
+            # Data analysis
+            td0, tkwargs0 = train_dataset.data[0]
+            print_example(td0, tokenizer, tkwargs0)
+            dataset_info['train_dataset'] = stat_dataset(train_dataset)
+            if val_dataset is not None:
+                dataset_info['val_dataset'] = stat_dataset(val_dataset)
+        else:
+            dataset_info = None
+            td0, tkwargs0 = template.encode(train_dataset[0])
+            print_example(td0, tokenizer, tkwargs0)
+            train_dataset = LazyLLMDataset(train_dataset, template)
+            if val_dataset is not None:
+                val_dataset = LazyLLMDataset(val_dataset, template)
+    
     else:
-        dataset_info = None
-        td0, tkwargs0 = template.encode(train_dataset[0])
-        print_example(td0, tokenizer, tkwargs0)
-        train_dataset = LazyLLMDataset(train_dataset, template)
-        if val_dataset is not None:
-            val_dataset = LazyLLMDataset(val_dataset, template)
+        dataset_info = {}
+        from swift.llm.utils.utils import LLMDataset
+        train_dataset = LLMDataset(torch.load(args.train_ds_cache))
+        dataset_info['train_dataset'] = stat_dataset(train_dataset)
+        if args.val_ds_cache is not None:
+            val_dataset = LLMDataset(torch.load(args.val_ds_cache))
+            dataset_info['val_dataset'] = stat_dataset(val_dataset)
+        
+
     if val_dataset is None:
         training_args.evaluation_strategy = IntervalStrategy.NO
         training_args.do_eval = False
@@ -232,6 +250,7 @@ def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
         trainer_kwargs['check_model'] = False
 
     trainer = Seq2SeqTrainer(
+        sequence_parallel_size=args.sequence_parallel_size,
         model=model,
         args=training_args,
         data_collator=data_collator,
