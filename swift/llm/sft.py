@@ -31,7 +31,6 @@ logger = get_logger()
 
 
 def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
-    init_dist('slurm', 'nccl', init_backend='deepspeed', port=29000)
     logger.info(f'args: {args}')
     seed_everything(args.seed)
     training_args = args.training_args

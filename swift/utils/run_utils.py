@@ -8,6 +8,7 @@ logger = get_logger()
 _TArgsClass = TypeVar('_TArgsClass')
 _T = TypeVar('_T')
 NoneType = type(None)
+from xtuner.parallel.sequence import init_dist
 
 
 def get_main(
@@ -16,6 +17,7 @@ def get_main(
 
     def x_main(argv: Union[List[str], _TArgsClass, NoneType] = None,
                **kwargs) -> _T:
+        init_dist('slurm', 'nccl', init_backend='deepspeed', port=29000)
         logger.info(
             f'Start time of running main: {datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}'
         )
