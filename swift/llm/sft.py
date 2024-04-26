@@ -26,12 +26,16 @@ from .utils import (TEMPLATE_MAPPING, LazyLLMDataset, SftArguments, Template,
                     print_example, set_generation_config, sort_by_max_length,
                     stat_dataset)
 from xtuner.parallel.sequence import init_dist
+from xtuner.dataset.huggingface import pack_dataset
+from datasets import Dataset, load_from_disk
+import torch.distributed as dist
 
 logger = get_logger()
 
 
 def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
     logger.info(f'args: {args}')
+    # seed_everything(42)
     seed_everything(args.seed)
     training_args = args.training_args
     if is_torch_npu_available():
@@ -214,6 +218,21 @@ def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
         if args.val_ds_cache is not None:
             val_dataset = LLMDataset(torch.load(args.val_ds_cache))
             dataset_info['val_dataset'] = stat_dataset(val_dataset)
+    
+    if dist.get_rank() == 0:
+        ds = [i[0] for i in train_dataset.data]
+        train_dataset = Dataset.from_list(ds)
+        train_dataset = pack_dataset(
+            train_dataset, max_length=32768, use_varlen_attn=False, 
+            shuffle_before_pack=True, map_num_proc=16)
+        objects = [train_dataset]
+        train_dataset.save_to_disk('alpaca_pack')
+    else:
+        objects = [None]
+    dist.broadcast_object_list(objects, src=0)
+    train_dataset = objects[0]
+    # breakpoint()
+    # train_dataset = load_from_disk('alpaca_pack')
         
 
     if val_dataset is None:

@@ -30,9 +30,13 @@ except ImportError:
 
 from xtuner.parallel.sequence import (
     init_sequence_parallel, SequenceParallelSampler, reduce_sequence_parallel_loss,
-    get_sequence_parallel_world_size)
+    get_sequence_parallel_world_size, get_sequence_parallel_group)
 from transformers.trainer_utils import seed_worker
 import torch.distributed as dist
+from mmengine.device.utils import get_max_cuda_memory
+from transformers.utils import is_torch_xla_available
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
 
 class Trainer(PushToMsHubMixin, SwiftMixin, HfTrainer):
     pass
@@ -211,8 +215,9 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
         loss = loss_fct(shift_logits, shift_labels)
         loss = shift_scale * loss
         return loss.mean()
-
+ 
     def compute_loss(self, model, inputs, return_outputs=None):
+        assert 'labels' in inputs
         if not hasattr(self, '_custom_metrics'):
             self._custom_metrics = {}
 
@@ -224,24 +229,8 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
 
         if self.label_smoother is not None and 'labels' in inputs:
             labels = inputs.pop('labels')
-        
-        # breakpoint()
 
         outputs = model(**inputs)
-
-        labels = inputs['labels']
-        num_tokens = (labels != -100).sum()
-        loss = reduce_sequence_parallel_loss(outputs.loss, num_tokens)
-        outputs.loss = loss
-
-        if dist.get_rank() == 0:
-            if not hasattr(self, 'cnt'):
-                self.cnt = 1
-            else:
-                self.cnt += 1
-            with open(f'logs/log_sp{get_sequence_parallel_world_size()}.txt', 'a+') as f:
-                f.write(f'step {self.cnt} tr_loss_step = {loss} \n')
-
         if loss_scale is not None:
             outputs['loss'] = self.compute_scaled_loss(labels, outputs.logits,
                                                        loss_scale)
@@ -251,7 +240,7 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
-        if self.label_smoother and labels is not None and loss_scale is None:
+        if labels is not None and loss_scale is None:
             unwrapped_model = unwrap_model(model)
             if is_peft_available() and isinstance(unwrapped_model, PeftModel):
                 model_name = unwrapped_model.base_model.model._get_name()
@@ -263,10 +252,24 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
                 loss = self.label_smoother(outputs, labels)
         else:
             loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
-
-        preds = outputs.logits.argmax(dim=2)[..., :-1]
+        
         if labels is None:
             labels = inputs['labels']
+
+        # reduce loss for logging correctly
+        num_tokens = (labels != -100).sum()
+        loss = reduce_sequence_parallel_loss(loss, num_tokens, get_sequence_parallel_group())
+
+        # if dist.get_rank() == 0:
+        #     if not hasattr(self, 'cnt'):
+        #         self.cnt = 1
+        #     else:
+        #         self.cnt += 1
+        #     with open(f'logs/log_sp{get_sequence_parallel_world_size()}.txt', 'a+') as f:
+        #         f.write(f'step {self.cnt} tr_loss_step = {loss} \n max mem = {get_max_cuda_memory()} \n')
+
+        preds = outputs.logits.argmax(dim=2)[..., :-1]
+        
         labels = labels[..., 1:]
         masks = labels != -100
         acc_strategy = getattr(self.args, 'acc_strategy', 'token')
@@ -289,11 +292,78 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
             self._custom_metrics['acc'] = self._custom_metrics[
                 'acc'] + acc / self.args.gradient_accumulation_steps
         return (loss, outputs) if return_outputs else loss
+    
+    # Support logging cuda memory usage
+    # hacky: Override Trainer's private method
+    def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval):
+        if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            if is_torch_xla_available():
+                xm.mark_step()
+
+            logs: Dict[str, float] = {}
+
+            # all_gather + mean() to get average loss over all processes
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+
+            # reset tr_loss to zero
+            tr_loss -= tr_loss
+
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            if grad_norm is not None:
+                logs["grad_norm"] = grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            logs["learning_rate"] = self._get_learning_rate()
+            logs["memory"] = get_max_cuda_memory()
+
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            self.log(logs)
+
+        metrics = None
+        if self.control.should_evaluate:
+            metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+            self._report_to_hp_search(trial, self.state.global_step, metrics)
+
+            # Run delayed LR scheduler now that metrics are populated
+            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                metric_to_check = self.args.metric_for_best_model
+                if not metric_to_check.startswith("eval_"):
+                    metric_to_check = f"eval_{metric_to_check}"
+                self.lr_scheduler.step(metrics[metric_to_check])
+
+        if self.control.should_save:
+            self._save_checkpoint(model, trial, metrics=metrics)
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def get_train_dataloader(self):
 
         if not use_torchacc():
-            return super().get_train_dataloader()
+            import datasets
+            if self.train_dataset is None:
+                raise ValueError("Trainer: training requires a train_dataset.")
+
+            train_dataset = self.train_dataset
+            data_collator = self.data_collator
+            if isinstance(train_dataset, datasets.Dataset):
+                train_dataset = self._remove_unused_columns(train_dataset, description="training")
+            else:
+                data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
+
+            dataloader_params = {
+                "batch_size": self._train_batch_size,
+                "collate_fn": data_collator,
+                "num_workers": self.args.dataloader_num_workers,
+                "pin_memory": self.args.dataloader_pin_memory,
+                "persistent_workers": self.args.dataloader_persistent_workers,
+            }
+
+            if not isinstance(train_dataset, torch.utils.data.IterableDataset):
+                dataloader_params["sampler"] = SequenceParallelSampler(train_dataset, seed=1024)
+                dataloader_params["drop_last"] = self.args.dataloader_drop_last
+                dataloader_params["worker_init_fn"] = seed_worker
+            
+            return DataLoader(train_dataset, **dataloader_params)
 
         else:
             if trainer.is_datasets_available():

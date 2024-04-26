@@ -3,6 +3,7 @@ from typing import Callable, List, Type, TypeVar, Union
 
 from .logger import get_logger
 from .utils import parse_args
+import os
 
 logger = get_logger()
 _TArgsClass = TypeVar('_TArgsClass')
@@ -10,14 +11,15 @@ _T = TypeVar('_T')
 NoneType = type(None)
 from xtuner.parallel.sequence import init_dist
 
-
 def get_main(
     args_class: Type[_TArgsClass], llm_x: Callable[[_TArgsClass], _T]
 ) -> Callable[[Union[List[str], _TArgsClass, NoneType]], _T]:
 
     def x_main(argv: Union[List[str], _TArgsClass, NoneType] = None,
                **kwargs) -> _T:
-        init_dist('slurm', 'nccl', init_backend='deepspeed', port=29000)
+        port = int(os.environ.get('MASTER_PORT', 29500))
+        init_dist('slurm', 'nccl', init_backend='deepspeed', port=port)
+        os.environ['LOCAL_WORLD_SIZE'] = str(min(int(os.environ['WORLD_SIZE']), 8))
         logger.info(
             f'Start time of running main: {datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}'
         )
